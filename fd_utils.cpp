@@ -17,23 +17,20 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 #include "fd_utils.h"
-
 #include <algorithm>
 #include <utility>
-
 #include <fcntl.h>
 #include <grp.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
-#include <memory>
-
 #include "android-base/stringprintf.h"
-
 static const char kFdPath[] = "/proc/self/fd";
 
+namespace android::base {
 static bool Readlink(const std::string& path, std::string* result) {
   result->clear();
   // Most Linux file systems (ext2 and ext4, say) limit symbolic links to
@@ -54,6 +51,7 @@ static bool Readlink(const std::string& path, std::string* result) {
     buf.resize(buf.size() * 2);
   }
 }
+}
 
 std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fail_fn_t fail_fn) {
   struct stat f_stat;
@@ -63,11 +61,9 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
     fail_fn(android::base::StringPrintf("Unable to stat %d", fd));
     return {};
   }
-
   if (S_ISSOCK(f_stat.st_mode)) {
     return std::unique_ptr<FileDescriptorInfo>(new FileDescriptorInfo(fd));
   }
-
   // We only handle allowlisted regular files and character devices. Allowlisted
   // character devices must provide a guarantee of sensible behaviour when
   // reopened.
@@ -80,7 +76,6 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
   // added to the redirection exemption list.
   if (!S_ISCHR(f_stat.st_mode) && !S_ISREG(f_stat.st_mode)) {
     std::string mode = "Unknown";
-
     if (S_ISDIR(f_stat.st_mode)) {
       mode = "DIR";
     } else if (S_ISLNK(f_stat.st_mode)) {
@@ -90,20 +85,17 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
     } else if (S_ISFIFO(f_stat.st_mode)) {
       mode = "FIFO";
     }
-
     fail_fn(android::base::StringPrintf("Unsupported st_mode for FD %d:  %s", fd, mode.c_str()));
     return {};
   }
-
   std::string file_path;
   const std::string fd_path = android::base::StringPrintf("/proc/self/fd/%d", fd);
-  if (!Readlink(fd_path, &file_path)) {
+  if (!android::base::Readlink(fd_path, &file_path)) {
     fail_fn(android::base::StringPrintf("Could not read fd link %s: %s",
                                         fd_path.c_str(),
                                         strerror(errno)));
     return {};
   }
-
   // File descriptor flags : currently on FD_CLOEXEC. We can set these
   // using F_SETFD - we're single threaded at this point of execution so
   // there won't be any races.
@@ -115,7 +107,6 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
                                         strerror(errno)));
     return {};
   }
-
   // File status flags :
   // - File access mode : (O_RDONLY, O_WRONLY...) we'll pass these through
   //   to the open() call.
@@ -136,36 +127,31 @@ std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fai
                                         strerror(errno)));
     return {};
   }
-
   // File offset : Ignore the offset for non seekable files.
   const off_t offset = TEMP_FAILURE_RETRY(lseek64(fd, 0, SEEK_CUR));
-
   // We pass the flags that open accepts to open, and use F_SETFL for
   // the rest of them.
   static const int kOpenFlags = (O_RDONLY | O_WRONLY | O_RDWR | O_DSYNC | O_SYNC);
   int open_flags = fs_flags & (kOpenFlags);
   fs_flags = fs_flags & (~(kOpenFlags));
-
   return std::unique_ptr<FileDescriptorInfo>(
     new FileDescriptorInfo(f_stat, file_path, fd, open_flags, fd_flags, fs_flags, offset));
 }
-
 bool FileDescriptorInfo::RefersToSameFile() const {
   struct stat f_stat;
   if (TEMP_FAILURE_RETRY(fstat(fd, &f_stat)) == -1) {
     return false;
   }
-
   return f_stat.st_ino == stat.st_ino && f_stat.st_dev == stat.st_dev;
 }
-
 void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
   if (is_sock) {
     return DetachSocket(fail_fn);
   }
-  
+  // NOTE: This might happen if the file was unlinked after being opened.
+  // It's a common pattern in the case of temporary files and the like but
+  // we should not allow such usage from the zygote.
   const int new_fd = TEMP_FAILURE_RETRY(open(file_path.c_str(), open_flags));
-
   if (new_fd == -1) {
     fail_fn(android::base::StringPrintf("Failed open(%s, %i): %s",
                                         file_path.c_str(),
@@ -173,7 +159,6 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
                                         strerror(errno)));
     return;
   }
-
   if (TEMP_FAILURE_RETRY(fcntl(new_fd, F_SETFD, fd_flags)) == -1) {
     close(new_fd);
     fail_fn(android::base::StringPrintf("Failed fcntl(%d, F_SETFD, %d) (%s): %s",
@@ -183,7 +168,6 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
                                         strerror(errno)));
     return;
   }
-
   if (TEMP_FAILURE_RETRY(fcntl(new_fd, F_SETFL, fs_flags)) == -1) {
     close(new_fd);
     fail_fn(android::base::StringPrintf("Failed fcntl(%d, F_SETFL, %d) (%s): %s",
@@ -193,7 +177,6 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
                                         strerror(errno)));
     return;
   }
-
   if (offset != -1 && TEMP_FAILURE_RETRY(lseek64(new_fd, offset, SEEK_SET)) == -1) {
     close(new_fd);
     fail_fn(android::base::StringPrintf("Failed lseek64(%d, SEEK_SET) (%s): %s",
@@ -202,7 +185,6 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
                                         strerror(errno)));
     return;
   }
-
   int dup_flags = (fd_flags & FD_CLOEXEC) ? O_CLOEXEC : 0;
   if (TEMP_FAILURE_RETRY(dup3(new_fd, fd, dup_flags)) == -1) {
     close(new_fd);
@@ -214,10 +196,8 @@ void FileDescriptorInfo::ReopenOrDetach(fail_fn_t fail_fn) const {
                                         strerror(errno)));
     return;
   }
-
   close(new_fd);
 }
-
 FileDescriptorInfo::FileDescriptorInfo(int fd) :
   fd(fd),
   stat(),
@@ -227,7 +207,6 @@ FileDescriptorInfo::FileDescriptorInfo(int fd) :
   offset(0),
   is_sock(true) {
 }
-
 FileDescriptorInfo::FileDescriptorInfo(struct stat stat, const std::string& file_path,
                                        int fd, int open_flags, int fd_flags, int fs_flags,
                                        off_t offset) :
@@ -240,26 +219,54 @@ FileDescriptorInfo::FileDescriptorInfo(struct stat stat, const std::string& file
   offset(offset),
   is_sock(false) {
 }
-
+bool FileDescriptorInfo::GetSocketName(std::string* result) {
+  sockaddr_storage ss;
+  sockaddr* addr = reinterpret_cast<sockaddr*>(&ss);
+  socklen_t addr_len = sizeof(ss);
+  if (TEMP_FAILURE_RETRY(getsockname(fd, addr, &addr_len)) == -1) {
+    return false;
+  }
+  if (addr->sa_family != AF_UNIX) {
+    return false;
+  }
+  const sockaddr_un* unix_addr = reinterpret_cast<const sockaddr_un*>(&ss);
+  size_t path_len = addr_len - offsetof(struct sockaddr_un, sun_path);
+  // This is an unnamed local socket, we do not accept it.
+  if (path_len == 0) {
+    return false;
+  }
+  // This is a local socket with an abstract address. Remove the leading NUL byte and
+  // add a human-readable "ABSTRACT/" prefix.
+  if (unix_addr->sun_path[0] == '\0') {
+    *result = "ABSTRACT/";
+    result->append(&unix_addr->sun_path[1], path_len - 1);
+    return true;
+  }
+  // If we're here, sun_path must refer to a null terminated filesystem
+  // pathname (man 7 unix). Remove the terminator before assigning it to an
+  // std::string.
+  if (unix_addr->sun_path[path_len - 1] ==  '\0') {
+    --path_len;
+  }
+  result->assign(unix_addr->sun_path, path_len);
+  return true;
+}
 void FileDescriptorInfo::DetachSocket(fail_fn_t fail_fn) const {
   const int dev_null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
   if (dev_null_fd < 0) {
     fail_fn(std::string("Failed to open /dev/null: ").append(strerror(errno)));
     return;
   }
-
   if (dup3(dev_null_fd, fd, O_CLOEXEC) == -1) {
     fail_fn(android::base::StringPrintf("Failed dup3 on socket descriptor %d: %s",
                                         fd,
                                         strerror(errno)));
     return;
   }
-
   if (close(dev_null_fd) == -1) {
     fail_fn(android::base::StringPrintf("Failed close(%d): %s", dev_null_fd, strerror(errno)));
   }
 }
-
 // TODO: Move the definitions here and eliminate the forward declarations. They
 // temporarily help making code reviews easier.
 static int ParseFd(dirent* dir_entry, int dir_fd);
@@ -271,7 +278,6 @@ std::unique_ptr<std::set<int>> GetOpenFds(fail_fn_t fail_fn) {
                                         kFdPath,
                                         strerror(errno)));
   }
-
   auto result = std::make_unique<std::set<int>>();
   int dir_fd = dirfd(proc_fd_dir);
   dirent* dir_entry;
@@ -283,7 +289,6 @@ std::unique_ptr<std::set<int>> GetOpenFds(fail_fn_t fail_fn) {
 
     result->insert(fd);
   }
-
   if (closedir(proc_fd_dir) == -1) {
     fail_fn(android::base::StringPrintf("Unable to close directory: %s", strerror(errno)));
   }
@@ -296,12 +301,10 @@ static int ParseFd(dirent* dir_entry, int dir_fd) {
   if ((*end) != '\0') {
     return -1;
   }
-
   // Don't bother with the standard input/output/error, they're handled
   // specially post-fork anyway.
   if (fd <= STDERR_FILENO || fd == dir_fd) {
     return -1;
   }
-
   return fd;
 }
