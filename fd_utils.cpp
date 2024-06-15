@@ -30,7 +30,8 @@
 #include "android-base/stringprintf.h"
 static const char kFdPath[] = "/proc/self/fd";
 
-namespace android::base {
+namespace android {
+namespace base {
 static bool Readlink(const std::string& path, std::string* result) {
   result->clear();
   // Most Linux file systems (ext2 and ext4, say) limit symbolic links to
@@ -51,7 +52,8 @@ static bool Readlink(const std::string& path, std::string* result) {
     buf.resize(buf.size() * 2);
   }
 }
-}
+}  // namespace base
+}  // namespace android
 
 std::unique_ptr<FileDescriptorInfo> FileDescriptorInfo::CreateFromFd(int fd, fail_fn_t fail_fn) {
   struct stat f_stat;
